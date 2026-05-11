@@ -1,0 +1,14 @@
+../Core/Src/main.c:87:5:main	3
+../Core/Src/main.c:160:6:SystemClock_Config	3
+../Core/Src/main.c:207:13:MX_FDCAN1_Init	2
+../Core/Src/main.c:250:13:MX_LPUART1_UART_Init	5
+../Core/Src/main.c:297:13:MX_USART3_UART_Init	5
+../Core/Src/main.c:346:13:MX_TIM1_Init	7
+../Core/Src/main.c:428:13:MX_TIM3_Init	3
+../Core/Src/main.c:477:13:MX_TIM6_Init	3
+../Core/Src/main.c:515:13:MX_TIM16_Init	2
+../Core/Src/main.c:547:13:MX_GPIO_Init	1
+../Core/Src/main.c:627:5:_write	1
+../Core/Src/main.c:633:6:HAL_GPIO_EXTI_Callback	2
+../Core/Src/main.c:641:6:HAL_TIM_PeriodElapsedCallback	2
+../Core/Src/main.c:653:6:Error_Handler	1
