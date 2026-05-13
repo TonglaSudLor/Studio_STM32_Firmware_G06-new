@@ -61,7 +61,6 @@ static bool a_long_press_handled = false;
 static uint32_t a_button_click_count = 0;
 static uint32_t a_button_last_release_tick = 0;
 static bool a_button_evaluating = false;
-static bool returning_home = false;
 
 /* Autotune State Machine */
 static struct {
@@ -412,6 +411,7 @@ void Motor_Init(void)
     
     tuning.jog_speed_fine = JOG_SPEED_FINE; 
     tuning.move_speed_coarse = MOVE_SPEED_COARSE;
+    tuning.move_speed_return_home = MOVE_SPEED_RETURN_HOME;
     tuning.step_size_coarse = STEP_SIZE_COARSE; 
     tuning.step_size_fine = STEP_SIZE_FINE;
     tuning.min_pwm = DEFAULT_MIN_PWM; 
@@ -746,7 +746,12 @@ void Motor_ProcessCommand(char cmd)
     if (control_system_mode == CONTROL_MODE_BASE_SYSTEM) return;
 
     // PRIORITY 4: Motion Commands (Blocked if E-Stop)
-    if (emergency_stop) return;
+    if (emergency_stop) {
+        if (cmd != 'O') {
+            Motor_SendAudioCommand('E');
+        }
+        return;
+    }
 
     switch (cmd)
     {
@@ -807,8 +812,6 @@ void Motor_ProcessCommand(char cmd)
         break;
     case 'Y': 
         if (current_mode == MOTOR_MODE_GHOST) {
-            float rel_target = buffered_target_pos - encoder.current_position_deg;
-            
             trajectory.target_pos = buffered_target_pos;
             ghost_buffer_idx = 0; 
             ghost_move_active = true;
@@ -825,6 +828,8 @@ void Motor_ProcessCommand(char cmd)
 
 void Motor_ControlLoop(void)
 {
+    static float current_applied_pwm = 0.0f;
+
     HW_RefreshIO();  // Sync all hardware I/O with debug struct
     Encoder_Update();
     target_position_deg = trajectory.target_pos;
@@ -922,13 +927,15 @@ void Motor_ControlLoop(void)
             Motor_SendAudioCommand('2');
             trajectory.target_pos = 0.0f;
             current_mode = MOTOR_MODE_POSITION;
-            printf("[HOME] Moving to Temporary Home (0.0)\r\n");
+            Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
+            printf("[HOME] Moving to Temporary Home (0.0) at %.1f RPM\r\n", tuning.move_speed_return_home);
         } else if (a_button_click_count >= 3) {
             // TRIPLE CLICK: Go to Original Home
             Motor_SendAudioCommand('3');
             trajectory.target_pos = original_home_offset_deg;
             current_mode = MOTOR_MODE_POSITION;
-            printf("[HOME] Moving to Original Home (%.2f)\r\n", original_home_offset_deg);
+            Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
+            printf("[HOME] Moving to Original Home (%.2f) at %.1f RPM\r\n", original_home_offset_deg, tuning.move_speed_return_home);
         }
         
         a_button_click_count = 0;
@@ -952,6 +959,74 @@ void Motor_ControlLoop(void)
         }
     }
 
+    /* --- Safety Monitoring --- */
+    bool stall_condition = false;
+
+    // 1. Stall Detection
+    if (fabsf(current_applied_pwm) >= STALL_PWM_THRESHOLD && fabsf(encoder.filtered_rpm) < STALL_VELOCITY_THRESHOLD) {
+        if (current_mode == MOTOR_MODE_POSITION || current_mode == MOTOR_MODE_GHOST) {
+            float pos_error = fabsf(trajectory.target_pos - encoder.current_position_deg);
+            if (pos_error > STALL_SETTLING_ERROR_DEG) stall_condition = true;
+        } else if (current_mode == MOTOR_MODE_SPEED) {
+            stall_condition = true;
+        }
+    }
+
+    // 2. Encoder Phase Inversion
+    if ((current_applied_pwm > ENCODER_FAULT_PWM_THRESHOLD && encoder.filtered_rpm < -ENCODER_INVERSION_RPM_LIMIT) ||
+        (current_applied_pwm < -ENCODER_FAULT_PWM_THRESHOLD && encoder.filtered_rpm > ENCODER_INVERSION_RPM_LIMIT)) {
+        fault_code |= FAULT_ENCODER_ERROR;
+        if (safety_enabled) {
+            emergency_stop = true;
+            printf("CRITICAL: ENCODER INVERTED / PHASE ERROR\r\n");
+            PWM_Apply(0.0f);
+        }
+    }
+
+    // 3. Encoder Signal Loss
+    if (fabsf(current_applied_pwm) > ENCODER_FAULT_PWM_THRESHOLD && 
+        fabsf(encoder.filtered_rpm) < STALL_VELOCITY_THRESHOLD &&
+        encoder.absolute_counts == last_absolute_counts) {
+        
+        if (encoder_fault_timer == 0) encoder_fault_timer = HAL_GetTick();
+        else if (HAL_GetTick() - encoder_fault_timer >= 1000) {
+            fault_code |= FAULT_ENCODER_ERROR;
+            if (safety_enabled) {
+                emergency_stop = true;
+                printf("CRITICAL: ENCODER DISCONNECTED / NO SIGNAL\r\n");
+                PWM_Apply(0.0f);
+            }
+        }
+    } else {
+        encoder_fault_timer = 0;
+        last_absolute_counts = encoder.absolute_counts;
+    }
+
+    // Stall Timer
+    if (stall_condition) {
+        if (stall_timer == 0) stall_timer = HAL_GetTick();
+        else if (HAL_GetTick() - stall_timer >= STALL_TIME_MS) {
+            fault_code |= FAULT_MOTOR_STALLED;
+            if (safety_enabled) {
+                emergency_stop = true;
+                printf("CRITICAL: MOTOR STALLED\r\n");
+                PWM_Apply(0.0f);
+            }
+        }
+    } else {
+        stall_timer = 0;
+    }
+
+    // 4. Over-Rotation Protection (Virtual Wall Notification)
+    if (fabsf(encoder.current_position_deg) > SOFT_LIMIT_DEG) {
+        if (!(fault_code & FAULT_OVER_ROTATION)) {
+            fault_code |= FAULT_OVER_ROTATION;
+            printf("WARNING: SOFT LIMIT REACHED (HARD STOP ACTIVE)\r\n");
+        }
+    } else {
+        fault_code &= ~FAULT_OVER_ROTATION;
+    }
+
     // Stop motor if e-stop or stopped mode
     if (emergency_stop || current_mode == MOTOR_MODE_STOPPED) { 
         if (ghost_move_active) {
@@ -959,6 +1034,15 @@ void Motor_ControlLoop(void)
             ghost_dump_requested = true;
         }
         PWM_Apply(0.0f); 
+
+        // Continuously sync trajectory during E-Stop so the motor does not violently snap 
+        // back to an old target position when the E-Stop state is cleared.
+        trajectory.target_pos = encoder.current_position_deg;
+        trajectory.current_setpoint_pos = encoder.current_position_deg;
+        trajectory.current_setpoint_vel = 0.0f;
+        pid_speed.integral = 0.0f;
+        pid_position.integral = 0.0f;
+        
         return; 
     }
 
@@ -1083,8 +1167,6 @@ void Motor_ControlLoop(void)
         return;
     }
 
-    float current_applied_pwm = 0.0f;
-
     /* --- Velocity Loop --- */
     if (current_mode == MOTOR_MODE_SPEED) {
         // VIRTUAL HARD STOPS: Prevent further motion in the direction of the limit
@@ -1115,9 +1197,10 @@ void Motor_ControlLoop(void)
         }
         Trajectory_Generator_Update();
         
-        // Dynamic speed recovery
-        if (tuning.move_speed_coarse < 100.0f && fabsf(encoder.current_position_deg) < 1.0f) {
-            tuning.move_speed_coarse = 100.0f;
+        // Dynamic speed recovery: If speed dropped (e.g. from return home or open loop test), 
+        // restore it to MOVE_SPEED_COARSE once it physically settles near 0
+        if (tuning.move_speed_coarse != MOVE_SPEED_COARSE && fabsf(encoder.current_position_deg) < 1.0f) {
+            tuning.move_speed_coarse = MOVE_SPEED_COARSE;
         }
 
         float target_rpm = PID_Compute(&pid_position, trajectory.current_setpoint_pos, encoder.current_position_deg);
@@ -1142,76 +1225,6 @@ void Motor_ControlLoop(void)
                 ghost_settle_start_tick = 0;
             }
         }
-    }
-
-    /* --- Safety Monitoring --- */
-    bool stall_condition = false;
-
-    // 1. Stall Detection
-    if (fabsf(current_applied_pwm) >= STALL_PWM_THRESHOLD && fabsf(encoder.filtered_rpm) < STALL_VELOCITY_THRESHOLD) {
-        if (current_mode == MOTOR_MODE_POSITION || current_mode == MOTOR_MODE_GHOST) {
-            float pos_error = fabsf(trajectory.target_pos - encoder.current_position_deg);
-            if (pos_error > STALL_SETTLING_ERROR_DEG) stall_condition = true;
-        } else if (current_mode == MOTOR_MODE_SPEED) {
-            stall_condition = true;
-        }
-    }
-
-    // 2. Encoder Phase Inversion
-    if ((current_applied_pwm > ENCODER_FAULT_PWM_THRESHOLD && encoder.filtered_rpm < -ENCODER_INVERSION_RPM_LIMIT) ||
-        (current_applied_pwm < -ENCODER_FAULT_PWM_THRESHOLD && encoder.filtered_rpm > ENCODER_INVERSION_RPM_LIMIT)) {
-        fault_code |= FAULT_ENCODER_ERROR;
-        if (safety_enabled) {
-            emergency_stop = true;
-            printf("CRITICAL: ENCODER INVERTED / PHASE ERROR\r\n");
-            PWM_Apply(0.0f);
-            return;
-        }
-    }
-
-    // 3. Encoder Signal Loss
-    if (fabsf(current_applied_pwm) > ENCODER_FAULT_PWM_THRESHOLD && 
-        fabsf(encoder.filtered_rpm) < STALL_VELOCITY_THRESHOLD &&
-        encoder.absolute_counts == last_absolute_counts) {
-        
-        if (encoder_fault_timer == 0) encoder_fault_timer = HAL_GetTick();
-        else if (HAL_GetTick() - encoder_fault_timer >= 1000) {
-            fault_code |= FAULT_ENCODER_ERROR;
-            if (safety_enabled) {
-                emergency_stop = true;
-                printf("CRITICAL: ENCODER DISCONNECTED / NO SIGNAL\r\n");
-                PWM_Apply(0.0f);
-                return;
-            }
-        }
-    } else {
-        encoder_fault_timer = 0;
-        last_absolute_counts = encoder.absolute_counts;
-    }
-
-    // Stall Timer
-    if (stall_condition) {
-        if (stall_timer == 0) stall_timer = HAL_GetTick();
-        else if (HAL_GetTick() - stall_timer >= STALL_TIME_MS) {
-            fault_code |= FAULT_MOTOR_STALLED;
-            if (safety_enabled) {
-                emergency_stop = true;
-                printf("CRITICAL: MOTOR STALLED\r\n");
-                PWM_Apply(0.0f);
-            }
-        }
-    } else {
-        stall_timer = 0;
-    }
-
-    // 4. Over-Rotation Protection (Virtual Wall Notification)
-    if (fabsf(encoder.current_position_deg) > SOFT_LIMIT_DEG) {
-        if (!(fault_code & FAULT_OVER_ROTATION)) {
-            fault_code |= FAULT_OVER_ROTATION;
-            printf("WARNING: SOFT LIMIT REACHED (HARD STOP ACTIVE)\r\n");
-        }
-    } else {
-        fault_code &= ~FAULT_OVER_ROTATION;
     }
 }
 

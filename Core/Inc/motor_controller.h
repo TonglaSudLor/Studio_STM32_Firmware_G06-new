@@ -104,6 +104,7 @@ typedef struct {
     float move_speed_coarse;   /**< RPM for step movement */
     float step_size_coarse;    /**< Degrees per click in Coarse mode */
     float step_size_fine;      /**< Degrees per click in Fine mode */
+    float move_speed_return_home; /**< Custom RPM for returning to home/origin */
     float min_pwm;             /**< Minimum PWM to overcome friction */
     float max_accel;           /**< Maximum acceleration (RPM/s) */
 } Motor_TuningParams_t;

@@ -117,13 +117,18 @@ void HW_RefreshIO(void)
     apply_outputs();
 }
 
+extern void Motor_SendAudioCommand(char sound_code);
+
 void HW_EStop_Trigger(void)
 {
     /* Still called from EXTI, ensures immediate hardware response */
     hw.in_estop = 1; 
     hw.out_relay_status = 1;
     hw.out_relay_motor  = 0; /* Must be 0 (OFF) for safe state! */
-    emergency_stop      = true;
+    if (!emergency_stop) {
+        emergency_stop = true;
+        Motor_SendAudioCommand('E');
+    }
     apply_outputs();
 }
 

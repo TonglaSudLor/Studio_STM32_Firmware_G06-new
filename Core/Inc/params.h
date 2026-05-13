@@ -14,7 +14,7 @@
 #define DEFAULT_SPEED_KP    1.0f
 #define DEFAULT_SPEED_KI    2.0f
 #define DEFAULT_SPEED_KD    0.0f
-#define DEFAULT_SPEED_KF    1.302f  /**< Your characterized Feed-Forward gain */
+#define DEFAULT_SPEED_KF    0.0f  /**< Your characterized Feed-Forward gain */
 
 /* Position Loop (Outer) */
 #define DEFAULT_POS_KP      1.2f    /**< Increased for snappy response with S-Curve */
@@ -27,6 +27,7 @@
 
 #define JOG_SPEED_FINE      10.0f   /**< Increased for better feedback */
 #define MOVE_SPEED_COARSE   69.75f  /**< 7.304 rad/s converted to RPM */
+#define MOVE_SPEED_RETURN_HOME 30.0f /**< Custom speed for returning to home/origin */
 
 #define STEP_SIZE_COARSE    10.0f
 #define STEP_SIZE_FINE      1.0f
