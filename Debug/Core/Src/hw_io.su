@@ -1,5 +1,5 @@
-../Core/Src/hw_io.c:25:13:apply_outputs	8	static
-../Core/Src/hw_io.c:56:6:HW_Init	8	static
-../Core/Src/hw_io.c:72:6:HW_RefreshIO	8	static
-../Core/Src/hw_io.c:114:6:HW_EStop_Trigger	8	static
-../Core/Src/hw_io.c:124:6:HW_EStop_Clear	4	static
+../Core/Src/hw_io.c:26:13:apply_outputs	8	static
+../Core/Src/hw_io.c:57:6:HW_Init	8	static
+../Core/Src/hw_io.c:73:6:HW_RefreshIO	8	static
+../Core/Src/hw_io.c:120:6:HW_EStop_Trigger	8	static
+../Core/Src/hw_io.c:130:6:HW_EStop_Clear	4	static

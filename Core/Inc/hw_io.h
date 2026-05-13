@@ -34,6 +34,8 @@ typedef struct {
     volatile uint8_t in_proximity;    /* PA6  Proximity sensor via Opto CH2 (1=detected) */
     volatile uint8_t in_select_mode;  /* PA7  Mode switch via Opto CH3    (1=Joystick, 0=Base) */
     volatile uint8_t in_reset_btn;    /* PB6  Reset button via Opto CH4   (1=pressed) */
+    volatile uint8_t raw_prox_bit;    /* PA6  Raw bit state (0 or 1) for debugging */
+    volatile uint8_t sanity_check;   /* Should be 0xAA (170) if code is updated */
 
     /* --- Relay Outputs --- */
     volatile uint8_t out_relay_motor;  /* PB12 Relay CH1: Motor Power      (1=ON, 0=OFF) */

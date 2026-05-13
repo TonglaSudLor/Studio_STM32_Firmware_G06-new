@@ -87,9 +87,7 @@ void Error_Handler(void);
 #define E_Stop_Pin GPIO_PIN_5
 #define E_Stop_GPIO_Port GPIOA
 #define E_Stop_EXTI_IRQn EXTI9_5_IRQn
-#define Proximity_Sensor_Pin GPIO_PIN_6
-#define Proximity_Sensor_GPIO_Port GPIOA
-#define Selected_Mode_Pin GPIO_PIN_7
+#define Selected_Mode_Pin GPIO_PIN_6
 #define Selected_Mode_GPIO_Port GPIOA
 #define Reed_Up_Pin GPIO_PIN_0
 #define Reed_Up_GPIO_Port GPIOB
@@ -109,6 +107,8 @@ void Error_Handler(void);
 #define T_SWO_GPIO_Port GPIOB
 #define Reset_Btn_Pin GPIO_PIN_6
 #define Reset_Btn_GPIO_Port GPIOB
+#define Proximity_Sensor_Pin GPIO_PIN_9
+#define Proximity_Sensor_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

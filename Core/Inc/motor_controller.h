@@ -33,7 +33,8 @@ typedef enum {
     MOTOR_MODE_AUTOTUNE,
     MOTOR_MODE_AUTOTUNE_SPEED,
     MOTOR_MODE_TEST,
-    MOTOR_MODE_GHOST
+    MOTOR_MODE_GHOST,
+    MOTOR_MODE_HOMING
 } Motor_ControlMode_t;
 
 /**
@@ -150,7 +151,7 @@ typedef struct {
 } Trajectory_State_t;
 
 /* --- Ghost Mode Buffering --- */
-#define GHOST_BUFFER_MAX 200
+#define GHOST_BUFFER_MAX 1000
 typedef struct {
     uint32_t tick;
     int32_t pos_x100;
@@ -173,6 +174,8 @@ extern volatile float target_position_deg;
 extern volatile float buffered_target_pos;   /**< Ghost target for S-curve testing */
 extern volatile bool ghost_move_active;
 extern volatile uint32_t ghost_settle_start_tick;
+extern volatile float original_home_offset_deg;
+extern volatile bool trigger_homing_sequence;
 
 extern Ghost_Buffer_t ghost_buffer[GHOST_BUFFER_MAX];
 extern volatile uint32_t ghost_buffer_idx;
@@ -218,10 +221,18 @@ void Motor_SetMotionProfile(float max_rpm, float max_accel, float smoothing);
 void Motor_SetJogVelocity(float rpm);
 
 /**
+ * @brief Send audio command
+ * @param sound_code Code for sound to play
+ */
+void Motor_SendAudioCommand(char sound_code);
+
+/**
  * @brief Process incoming command characters
  * @param cmd Command character
  */
 void Motor_ProcessCommand(char cmd);
+void Motor_ProcessPacket(char action, char safety, char status);
+bool Motor_RunHomingSequence(void);
 
 /**
  * @brief Update selection button state

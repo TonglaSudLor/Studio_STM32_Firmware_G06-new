@@ -16,7 +16,8 @@
 
 /* --- Hardware Debug Struct Instance --- */
 HW_Debug_t hw = {
-    .override_enabled = 0
+    .override_enabled = 0,
+    .sanity_check = 0xAA
 };
 
 /* ============================================================================
@@ -74,7 +75,8 @@ void HW_RefreshIO(void)
     /* --- Read all Opto inputs (1 = Active) --- */
     /* E-Stop NO contact: Healthy = Opto OFF (Pin HIGH). Emergency = Opto ON (Pin LOW) */
     hw.in_estop       = (HAL_GPIO_ReadPin(E_Stop_GPIO_Port, E_Stop_Pin)             == GPIO_PIN_RESET) ? 1 : 0;
-    hw.in_proximity   = (HAL_GPIO_ReadPin(Proximity_Sensor_GPIO_Port, Proximity_Sensor_Pin) == GPIO_PIN_SET) ? 1 : 0;
+    hw.in_proximity   = (HAL_GPIO_ReadPin(Proximity_Sensor_GPIO_Port, Proximity_Sensor_Pin) == GPIO_PIN_RESET) ? 1 : 0;
+    hw.raw_prox_bit   = (HAL_GPIO_ReadPin(Proximity_Sensor_GPIO_Port, Proximity_Sensor_Pin) == GPIO_PIN_RESET) ? 1 : 0;
     hw.in_select_mode = (HAL_GPIO_ReadPin(Selected_Mode_GPIO_Port, Selected_Mode_Pin) == GPIO_PIN_RESET) ? 1 : 0;
     hw.in_reset_btn   = (HAL_GPIO_ReadPin(Reset_Btn_GPIO_Port, Reset_Btn_Pin)       == GPIO_PIN_RESET) ? 1 : 0;
 
@@ -99,6 +101,10 @@ void HW_RefreshIO(void)
             hw.out_relay_status = 0; /* Green Light ON */
             hw.out_relay_motor  = 1; /* Motor Relay ON (NC) */
         }
+    } else {
+        /* In override mode, still update emergency_stop flag but don't force outputs */
+        if (hw.in_estop) emergency_stop = true;
+        else if (hw.in_reset_btn) emergency_stop = false;
     }
 
     /* --- Update Mode lamp if not overridden --- */

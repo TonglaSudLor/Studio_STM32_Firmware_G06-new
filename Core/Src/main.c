@@ -56,6 +56,8 @@ TIM_HandleTypeDef htim16;
 
 /* USER CODE BEGIN PV */
 volatile uint8_t rx_byte;
+volatile char rx_packet[4];
+volatile int rx_ptr = 0;
 volatile char rx_debug_log[16];  // Circular log to see command history in Live Expressions
 volatile uint8_t debug_idx = 0;
 volatile uint8_t modbus_rx_byte;
@@ -125,6 +127,37 @@ int main(void)
 
   HAL_UART_Receive_IT(&hlpuart1, (uint8_t*)&modbus_rx_byte, 1);
   HAL_UART_Receive_IT(&huart3, (uint8_t*)&rx_byte, 1);
+
+  /* --- Startup Selection --- */
+  printf("\r\n==========================================\r\n");
+  printf("   ROBO-COOK STARTUP SELECTION\r\n");
+  printf("==========================================\r\n");
+  printf(" [A] - RUN AUTO-HOMING (RECALIBRATE)\r\n");
+  printf(" [B] - SKIP (USE CURRENT POSITION)\r\n");
+  printf(" Waiting for Joystick...\r\n");
+
+  extern volatile bool emergency_stop;
+  emergency_stop = true; // Stay locked until choice made
+
+  while (1) {
+      if (rx_packet[0] == 'A') {
+          printf("\r\n>>> HOMING SELECTED <<<\r\n");
+          emergency_stop = false; 
+          while (!Motor_RunHomingSequence()) {
+              HAL_Delay(10); 
+          }
+          rx_packet[0] = 'O'; // Reset to neutral
+          break;
+      } 
+      else if (rx_packet[0] == 'B') {
+          printf("\r\n>>> HOMING SKIPPED <<<\r\n");
+          emergency_stop = false;
+          rx_packet[0] = 'O'; // Reset to neutral
+          break;
+      }
+      HAL_Delay(50);
+  }
+  printf(" System Ready. Entering Main Loop...\r\n\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -141,6 +174,16 @@ int main(void)
     if (HAL_GetTick() - last_matlab_tick >= 20) {
       Motor_SendDataToMatlab();
       last_matlab_tick = HAL_GetTick();
+    }
+
+    if (trigger_homing_sequence) {
+      static uint32_t last_homing_tick = 0;
+      if (HAL_GetTick() - last_homing_tick >= 10) {
+        if (Motor_RunHomingSequence()) {
+          trigger_homing_sequence = false;
+        }
+        last_homing_tick = HAL_GetTick();
+      }
     }
 
     ModbusBridge_UpdateRegisters();
@@ -254,7 +297,7 @@ static void MX_LPUART1_UART_Init(void)
 
   /* USER CODE END LPUART1_Init 1 */
   hlpuart1.Instance = LPUART1;
-  hlpuart1.Init.BaudRate = 19200;
+  hlpuart1.Init.BaudRate = 115200;
   hlpuart1.Init.WordLength = UART_WORDLENGTH_8B;
   hlpuart1.Init.StopBits = UART_STOPBITS_1;
   hlpuart1.Init.Parity = UART_PARITY_NONE;
@@ -584,15 +627,15 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : E_Stop_Pin */
   GPIO_InitStruct.Pin = E_Stop_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(E_Stop_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : Proximity_Sensor_Pin Selected_Mode_Pin */
-  GPIO_InitStruct.Pin = Proximity_Sensor_Pin|Selected_Mode_Pin;
+  /*Configure GPIO pin : Selected_Mode_Pin */
+  GPIO_InitStruct.Pin = Selected_Mode_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(Selected_Mode_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : Reed_Up_Pin Relay__SysStatus_Pin Relay_Sysmode_Pin Relay_MotorPower_Pin */
   GPIO_InitStruct.Pin = Reed_Up_Pin|Relay__SysStatus_Pin|Relay_Sysmode_Pin|Relay_MotorPower_Pin;
@@ -601,11 +644,11 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : Reset_Btn_Pin */
-  GPIO_InitStruct.Pin = Reset_Btn_Pin;
+  /*Configure GPIO pins : Reset_Btn_Pin Proximity_Sensor_Pin */
+  GPIO_InitStruct.Pin = Reset_Btn_Pin|Proximity_Sensor_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(Reset_Btn_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
@@ -622,7 +665,7 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 int _write(int file, char *ptr, int len)
 {
-  HAL_UART_Transmit(&huart3, (uint8_t*)ptr, len, HAL_MAX_DELAY);
+  HAL_UART_Transmit(&hlpuart1, (uint8_t*)ptr, len, HAL_MAX_DELAY);
   return len;
 }
 
@@ -639,6 +682,33 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM6) {
     Motor_ControlLoop();
   }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART3) {
+        char ch = (char)rx_byte;
+
+        // Debug logging (optional, keeps a history of raw bytes)
+        rx_debug_log[debug_idx++ % 16] = ch;
+
+        if (ch == '\n' || ch == '\r') {
+            if (rx_ptr == 3) {
+                // We have a full packet: [Action][Safety][Status]
+                Motor_ProcessPacket(rx_packet[0], rx_packet[1], rx_packet[2]);
+                
+                // Echo the action character back for the audio handshake
+                HAL_UART_Transmit(&huart3, (uint8_t*)&rx_packet[0], 1, 5);
+            }
+            rx_ptr = 0;
+        } else if (rx_ptr < 3) {
+            rx_packet[rx_ptr++] = ch;
+        }
+
+        HAL_UART_Receive_IT(&huart3, (uint8_t*)&rx_byte, 1);
+    } else if (huart->Instance == LPUART1) {
+        ModbusBridge_RxCallback(modbus_rx_byte);
+        HAL_UART_Receive_IT(&hlpuart1, (uint8_t*)&modbus_rx_byte, 1);
+    }
 }
 /* USER CODE END 4 */
 

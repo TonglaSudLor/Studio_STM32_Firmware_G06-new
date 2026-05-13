@@ -41,7 +41,7 @@
 #define PID_INTEGRAL_MAX    50.0f
 #define POS_INTEGRAL_MAX    200.0f
 
-#define DEFAULT_MIN_PWM     5.0f    /**< Increased to overcome static friction */
+#define DEFAULT_MIN_PWM     0.0f    /**< Increased to overcome static friction */
 #define DEFAULT_MAX_ACCEL   262.51f /**< 27.49 rad/s^2 converted to RPM/s^2 */
 
 /* ============================================================================
@@ -53,15 +53,18 @@
 #define STALL_TIME_MS            2000    /**< Give it 2 seconds to start moving */
 #define STALL_SETTLING_ERROR_DEG 5.0f    /**< Don't trigger stall if error < 5 deg */
 
-#define ENCODER_FAULT_PWM_THRESHOLD 25.0f   /**< PWM threshold for hardware check */
+#define ENCODER_FAULT_PWM_THRESHOLD 50.0f   /**< PWM threshold for hardware check */
 #define ENCODER_INVERSION_RPM_LIMIT 5.0f    /**< RPM threshold for inversion check */
 
 #define SOFT_LIMIT_DEG           720.0f  /**< 2 full rounds limit from home */
 
 /* ============================================================================
- * SYSTEM TIMING
+ * SYSTEM TIMING & HOMING
  * ============================================================================ */
+#define HOME_HOLD_TIME_MS   1000
 
-#define HOME_HOLD_TIME_MS   3000
+#define HOMING_SEARCH_RPM    3.0f    /**< Speed for wiggle search */
+#define HOMING_CREEP_RPM     3.0f    /**< Speed for fine edge detection */
+#define HOMING_MAX_WIGGLE    180.0f  /**< Max search amplitude to protect cables */
 
 #endif /* PARAMS_H */

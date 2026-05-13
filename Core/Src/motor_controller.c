@@ -19,6 +19,7 @@
 extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim6;
 extern TIM_HandleTypeDef htim1;
+extern UART_HandleTypeDef huart3;
 
 volatile Motor_ControlMode_t current_mode = MOTOR_MODE_STOPPED;
 volatile Control_SystemMode_t control_system_mode = CONTROL_MODE_BASE_SYSTEM;
@@ -35,6 +36,8 @@ volatile float target_position_deg = 0.0f;
 volatile float buffered_target_pos = 0.0f;
 volatile bool ghost_move_active = false;
 volatile uint32_t ghost_settle_start_tick = 0;
+volatile float original_home_offset_deg = 0.0f;
+volatile bool trigger_homing_sequence = false;
 Ghost_Buffer_t ghost_buffer[GHOST_BUFFER_MAX];
 volatile uint32_t ghost_buffer_idx = 0;
 volatile bool ghost_dump_requested = false;
@@ -54,6 +57,10 @@ static uint32_t encoder_fault_timer = 0;
 static uint32_t joystick_watchdog_timer = 0;
 static int32_t last_absolute_counts = 0;
 static bool a_button_is_held = false;
+static bool a_long_press_handled = false;
+static uint32_t a_button_click_count = 0;
+static uint32_t a_button_last_release_tick = 0;
+static bool a_button_evaluating = false;
 static bool returning_home = false;
 
 /* Autotune State Machine */
@@ -84,6 +91,7 @@ static float PID_Compute(PID_Controller_t *pid, float setpoint, float feedback);
 static void PWM_Apply(float duty_cycle);
 static void Encoder_Update(void);
 static void Trajectory_Generator_Update(void);
+void Motor_SendAudioCommand(char sound_code);
 
 /* ============================================================================
  * PID Control Implementation
@@ -148,6 +156,9 @@ static void Encoder_Update(void)
     // Handle timer rollover
     if (delta > 32767) delta -= 65536;
     else if (delta < -32768) delta += 65536;
+    
+    // Invert encoder direction to match motor phase
+    delta = -delta;
     
     encoder.count_prev = current_count;
     encoder.absolute_counts += delta;
@@ -246,6 +257,140 @@ static void Trajectory_Generator_Update(void)
 static float resolution_step = 10.0f; 
 static bool step_executed = false;   
 
+/* Homing State Variables */
+typedef enum {
+    H_IDLE = 0,
+    H_INIT,
+    H_WIGGLE_SEARCH,
+    H_FIND_EDGE_A,
+    H_FIND_EDGE_B,
+    H_CALCULATE_ZERO,
+    H_DONE,
+    H_ERROR
+} HomingState_t;
+
+static HomingState_t h_state = H_IDLE;
+static float h_edge_a = 0, h_edge_b = 0;
+static float h_wiggle_amp = 20.0f;
+static float h_start_pos = 0;
+static int h_direction = 1;
+
+/**
+ * @brief Standalone Homing Sequence Function
+ * @return true if homing is finished/successful, false while running.
+ */
+bool Motor_RunHomingSequence(void)
+{
+    // If emergency stop is active, reset homing
+    if (emergency_stop) {
+        h_state = H_IDLE;
+        return true; 
+    }
+
+    switch (h_state) {
+        case H_IDLE:
+            h_state = H_INIT;
+            return false;
+
+        case H_INIT:
+            h_start_pos = encoder.current_position_deg;
+            h_wiggle_amp = 20.0f;
+            h_direction = 1;
+            current_mode = MOTOR_MODE_HOMING;
+            // Set slow motion profile for homing
+            Motor_SetMotionProfile(HOMING_SEARCH_RPM, 50.0f, 0.1f);
+            h_state = H_WIGGLE_SEARCH;
+            printf("[HOMING] Starting Smooth Wiggle Search...\r\n");
+            return false;
+
+        case H_WIGGLE_SEARCH:
+            // Set smooth PID target
+            trajectory.target_pos = h_start_pos + (float)h_direction * h_wiggle_amp;
+
+            // Check sensor (PB9) - 0 means detected
+            if (!hw.raw_prox_bit) { 
+                h_state = H_FIND_EDGE_A;
+                printf("[HOMING] Target Found! Locating Edge A...\r\n");
+                return false;
+            }
+
+            // If we reached the wiggle target without finding anything, flip and expand
+            float error = trajectory.target_pos - encoder.current_position_deg;
+            if (fabsf(error) < 1.0f) {
+                h_direction *= -1;
+                h_wiggle_amp += 20.0f;
+                if (h_wiggle_amp > HOMING_MAX_WIGGLE) {
+                    h_state = H_ERROR;
+                    printf("[HOMING] ERROR: Target not found within limits.\r\n");
+                    Motor_SendAudioCommand('E');
+                }
+            }
+            return false;
+
+        case H_FIND_EDGE_A:
+            // Creep slowly (3 RPM) until sensor triggers
+            Motor_SetMotionProfile(HOMING_CREEP_RPM, 20.0f, 0.1f);
+            trajectory.target_pos += (float)h_direction * 0.5f; // Constant slow move
+
+            if (!hw.raw_prox_bit) {
+                h_edge_a = encoder.current_position_deg;
+                h_state = H_FIND_EDGE_B;
+                printf("[HOMING] Edge A: %.2f. Finding Edge B...\r\n", h_edge_a);
+            }
+            return false;
+
+        case H_FIND_EDGE_B:
+            // Continue moving until sensor releases
+            trajectory.target_pos += (float)h_direction * 0.5f; 
+
+            if (hw.raw_prox_bit) { 
+                h_edge_b = encoder.current_position_deg;
+                h_state = H_CALCULATE_ZERO;
+                printf("[HOMING] Edge B: %.2f\r\n", h_edge_b);
+            }
+            return false;
+
+        case H_CALCULATE_ZERO:
+            {
+                float center = (h_edge_a + h_edge_b) / 2.0f;
+                float offset = encoder.current_position_deg - center;
+                
+                // Set the new zero
+                encoder.absolute_counts = (int32_t)((offset / 360.0f) * (MOTOR_ENCODER_PPR * 4));
+                Encoder_Update(); // Force recalculation
+                
+                trajectory.target_pos = 0.0f;
+                trajectory.current_setpoint_pos = encoder.current_position_deg;
+                trajectory.current_setpoint_vel = 0.0f;
+                
+                // Reset PID Integrals to prevent windup spikes
+                pid_speed.integral = 0.0f;
+                pid_speed.error_prev = 0.0f;
+                pid_position.integral = 0.0f;
+                pid_position.error_prev = 0.0f;
+                
+                current_mode = MOTOR_MODE_POSITION;
+                original_home_offset_deg = 0.0f; // Sync temp and original home
+                Motor_SetMotionProfile(tuning.move_speed_coarse, tuning.max_accel, 0.1f); // Restore speeds
+                
+                printf("[HOMING] SUCCESS. Center found. Home set to 0.0\r\n");
+                Motor_SendAudioCommand('H');
+                h_state = H_DONE;
+            }
+            return false;
+
+        case H_DONE:
+            return true;
+
+        case H_ERROR:
+            current_mode = MOTOR_MODE_STOPPED;
+            return true;
+            
+        default: break;
+    }
+    return false;
+}
+
 /* ============================================================================
  * Public API Implementation
  * ============================================================================ */
@@ -310,6 +455,17 @@ void Motor_MoveToPosition(float target_degrees)
     current_mode = MOTOR_MODE_POSITION;
 }
 
+void Motor_Stop(void)
+{
+    PWM_Apply(0.0f);
+    current_mode = MOTOR_MODE_STOPPED;
+}
+
+void Motor_SendAudioCommand(char sound_code)
+{
+    HAL_UART_Transmit(&huart3, (uint8_t*)&sound_code, 1, 10);
+}
+
 void Motor_SetVoltageLimit(float max_voltage, float supply_voltage)
 {
     if (supply_voltage <= 0.0f) return;
@@ -322,7 +478,13 @@ void Motor_SetMotionProfile(float max_rpm, float max_accel, float smoothing)
 {
     tuning.move_speed_coarse = max_rpm; 
     tuning.max_accel = max_accel;
-    // Smoothing not fully implemented in Trajectory_Generator_Update yet
+    
+    // Update active trajectory limits
+    motion_config.max_velocity = max_rpm;
+    motion_config.max_acceleration = max_accel;
+    if (smoothing > 0.0f) {
+        motion_config.jerk_smoothing = smoothing;
+    }
 }
 
 void Motor_SetJogVelocity(float rpm)
@@ -441,6 +603,54 @@ void Motor_StartAutotuneSpeed(void)
     current_mode = MOTOR_MODE_AUTOTUNE_SPEED;
 }
 
+static bool last_joystick_status = false;
+static char last_safety_char = 'O';
+
+void Motor_ProcessPacket(char action, char safety, char status)
+{
+    bool current_status = (status == 'C');
+
+    // 1. Connection Event Notification
+    if (current_status && !last_joystick_status) {
+        printf("\r\n[SYSTEM] >>> JOYSTICK CONNECTED <<<\r\n");
+    } 
+    else if (!current_status && last_joystick_status) {
+        printf("\r\n[SYSTEM] !!! JOYSTICK DISCONNECTED !!!\r\n");
+    }
+    last_joystick_status = current_status;
+
+    // 2. Connection Status Logic
+    if (!current_status) {
+        is_joystick_connected = false;
+        fault_code |= FAULT_JOYSTICK_LOST;
+        emergency_stop = true;
+        return;
+    } else {
+        is_joystick_connected = true;
+        joystick_watchdog_timer = HAL_GetTick();
+        fault_code &= ~FAULT_JOYSTICK_LOST;
+    }
+
+    // 3. Safety / Emergency Button Toggle Logic (Rising Edge)
+    if (safety == 'P' && last_safety_char == 'O') {
+        // Toggle Emergency Stop
+        if (!emergency_stop) {
+            emergency_stop = true;
+            Motor_SendAudioCommand('E');
+            printf("[SAFETY] E-Stop LATCHED via Joystick\r\n");
+        } else if (!hw.in_estop && hw.raw_prox_bit) {
+            // Only clear if physical hardware is also safe
+            emergency_stop = false;
+            Motor_SendAudioCommand('C');
+            printf("[SAFETY] E-Stop CLEARED via Joystick\r\n");
+        }
+    }
+    last_safety_char = safety;
+
+    // 4. Action Command
+    Motor_ProcessCommand(action);
+}
+
 void Motor_ProcessCommand(char cmd)
 {
     // RESET WATCHDOG: Receiving any character indicates the joystick is alive
@@ -448,19 +658,10 @@ void Motor_ProcessCommand(char cmd)
     joystick_watchdog_timer = HAL_GetTick();
     fault_code &= ~FAULT_JOYSTICK_LOST;
 
-    // PRIORITY 1: Emergency Stop Logic
-    if (cmd == 'P') {
-        if (!emergency_stop) { 
-            emergency_stop = true; 
-            if (ghost_move_active) {
-                ghost_move_active = false;
-                ghost_dump_requested = true;
-            }
-        } else { 
-            emergency_stop = false; 
-            fault_code = FAULT_NONE; 
-            current_mode = MOTOR_MODE_STOPPED; 
-        }
+    // PRIORITY 1: Manual Emergency Stop Command
+    if (cmd == 'P' || cmd == 'X') {
+        emergency_stop = true;
+        Motor_SendAudioCommand('E');
         trajectory.current_setpoint_vel = 0.0f;
         trajectory.current_setpoint_pos = encoder.current_position_deg;
         trajectory.target_pos = encoder.current_position_deg;
@@ -469,24 +670,76 @@ void Motor_ProcessCommand(char cmd)
         return;
     }
 
-    // PRIORITY 2: Config Buttons (Allowed during E-Stop)
+    // PRIORITY 2: Config & Mode Buttons
     if (cmd == 'A') {
         if (!a_button_is_held) { 
             a_press_tick = HAL_GetTick(); 
             a_button_is_held = true; 
-            returning_home = false; 
+            a_long_press_handled = false;
+        }
+    } else if (cmd == 'O') {
+        if (a_button_is_held) {
+            if (!a_long_press_handled) {
+                uint32_t duration = HAL_GetTick() - a_press_tick;
+                if (duration < 2000) {
+                    a_button_click_count++;
+                    a_button_last_release_tick = HAL_GetTick();
+                    a_button_evaluating = true;
+                }
+            }
+            a_button_is_held = false; 
+            a_long_press_handled = false;
         }
     }
     
+    // B Button (Control Mode Toggle)
+    if (cmd == 'B') {
+        if (!b_button_active) {
+            b_button_hold_tick = HAL_GetTick();
+            b_button_active = true;
+        }
+    } else if (cmd == 'O') {
+        b_button_active = false;
+    }
+
+    // Y Button (Ghost Mode Toggle / Execute)
+    if (cmd == 'Y') {
+        if (!y_button_active) {
+            y_button_hold_tick = HAL_GetTick();
+            y_button_active = true;
+        }
+    } else if (cmd == 'O') {
+        if (y_button_active) {
+            uint32_t duration = HAL_GetTick() - y_button_hold_tick;
+            if (duration < 1000 && current_mode == MOTOR_MODE_GHOST) {
+                // SHORT PRESS in Ghost Mode -> EXECUTE MOVE
+                trajectory.target_pos = buffered_target_pos;
+                ghost_move_active = true;
+                ghost_buffer_idx = 0;
+                printf("START,%.2f\r\n", buffered_target_pos);
+            }
+            y_button_active = false;
+        }
+    }
+
+    // M Button (Jog Mode & Autotune)
     if (cmd == 'M') { 
-        if (jog_mode == JOG_COARSE) { 
-            jog_mode = JOG_FINE; 
-            resolution_step = tuning.step_size_fine; 
-        } else { 
-            jog_mode = JOG_COARSE; 
-            resolution_step = tuning.step_size_coarse; 
+        if (!m_button_active) {
+            m_button_hold_tick = HAL_GetTick();
+            m_button_active = true;
+
+            if (jog_mode == JOG_COARSE) { 
+                jog_mode = JOG_FINE; 
+                resolution_step = tuning.step_size_fine; 
+            } else { 
+                jog_mode = JOG_COARSE; 
+                resolution_step = tuning.step_size_coarse; 
+            }
+            Motor_SendAudioCommand('M');
         }
         return; 
+    } else if (cmd == 'O') {
+        m_button_active = false;
     }
 
     // PRIORITY 3: Base System Check
@@ -499,7 +752,15 @@ void Motor_ProcessCommand(char cmd)
     {
     case 'U': Gripper_Up(); break;
     case 'D': Gripper_Down(); break;
-    case 'F': Gripper_Toggle(); break;
+    case 'F': 
+        if (ghost_move_active) {
+            ghost_move_active = false;
+            ghost_dump_requested = true;
+            printf("MANUAL STOP\r\n");
+        } else {
+            Gripper_Toggle(); 
+        }
+        break;
     case 'S': Gripper_Sequence_Pick(); break;
     case 'G': Gripper_Sequence_Place(); break;
     case 'L': 
@@ -530,35 +791,9 @@ void Motor_ProcessCommand(char cmd)
             current_mode = MOTOR_MODE_SPEED; 
         }
         break;
+
     case 'O': 
         step_executed = false;
-        if (a_button_is_held) {
-            uint32_t duration = HAL_GetTick() - a_press_tick;
-            if (duration < 3000 && !returning_home) {
-                // RESET HOME POSITION
-                __HAL_TIM_SET_COUNTER(&htim3, 0);
-                encoder.count_prev = 0;
-                encoder.absolute_counts = 0;
-                encoder.current_position_deg = 0.0f;
-                encoder.filtered_rpm = 0.0f;
-                last_rpm_for_accel = 0.0f;
-                
-                trajectory.target_pos = 0.0f;
-                trajectory.current_setpoint_pos = 0.0f;
-                trajectory.current_setpoint_vel = 0.0f;
-                buffered_target_pos = 0.0f;
-                
-                pid_speed.integral = 0.0f;
-                pid_speed.error_prev = 0.0f;
-                pid_speed.d_filt = 0.0f;
-                
-                pid_position.integral = 0.0f;
-                pid_position.error_prev = 0.0f;
-                pid_position.d_filt = 0.0f;
-            }
-            a_button_is_held = false; 
-            returning_home = false;
-        }
         if (current_mode == MOTOR_MODE_SPEED) {
             if (jog_mode == JOG_FINE) {
                 current_mode = MOTOR_MODE_STOPPED;
@@ -573,7 +808,6 @@ void Motor_ProcessCommand(char cmd)
     case 'Y': 
         if (current_mode == MOTOR_MODE_GHOST) {
             float rel_target = buffered_target_pos - encoder.current_position_deg;
-//            printf("START,%.1f\r\n", fabsf(rel_target));
             
             trajectory.target_pos = buffered_target_pos;
             ghost_buffer_idx = 0; 
@@ -610,9 +844,11 @@ void Motor_ControlLoop(void)
         if (HAL_GetTick() - y_button_hold_tick >= 1000) {
             if (current_mode == MOTOR_MODE_GHOST) {
                 current_mode = MOTOR_MODE_POSITION;
+                Motor_SendAudioCommand('g');
             } else {
                 current_mode = MOTOR_MODE_GHOST;
                 buffered_target_pos = trajectory.target_pos;
+                Motor_SendAudioCommand('G');
             }
             y_button_active = false;
         }
@@ -623,9 +859,11 @@ void Motor_ControlLoop(void)
         if (HAL_GetTick() - b_button_hold_tick >= 1000) {
             if (control_system_mode == CONTROL_MODE_JOYSTICK) {
                 control_system_mode = CONTROL_MODE_BASE_SYSTEM;
+                Motor_SendAudioCommand('S');
                 printf("CONTROL: BASE_SYSTEM\r\n");
             } else {
                 control_system_mode = CONTROL_MODE_JOYSTICK;
+                Motor_SendAudioCommand('J');
                 printf("CONTROL: JOYSTICK\r\n");
             }
             b_button_active = false;
@@ -641,18 +879,65 @@ void Motor_ControlLoop(void)
         autotune_trigger = ATUNE_IDLE; 
     }
 
-    // Handle return home trigger
-    if (a_button_is_held && !returning_home) {
-        if (HAL_GetTick() - a_press_tick >= HOME_HOLD_TIME_MS) {
-            returning_home = true; 
-            trajectory.target_pos = 0.0f; 
-            current_mode = MOTOR_MODE_POSITION;
+    // Handle A Button State Machine (Multi-click & Long press)
+    if (a_button_is_held && !a_long_press_handled && (HAL_GetTick() - a_press_tick >= 2000)) {
+        // LONG PRESS: Trigger Homing Sequence
+        if (current_mode != MOTOR_MODE_HOMING) {
+            trigger_homing_sequence = true;
+            Motor_SendAudioCommand('h');
         }
+        a_long_press_handled = true;
+        a_button_click_count = 0;
+        a_button_evaluating = false;
+    } else if (!a_button_is_held && a_button_evaluating && (HAL_GetTick() - a_button_last_release_tick > 400)) {
+        // TIMEOUT REACHED: Evaluate clicks
+        if (a_button_click_count == 1) {
+            // SINGLE CLICK: Set Temporary Home
+            Motor_SendAudioCommand('T');
+            original_home_offset_deg -= encoder.current_position_deg;
+            
+            __HAL_TIM_SET_COUNTER(&htim3, 0);
+            encoder.count_prev = 0;
+            encoder.absolute_counts = 0;
+            encoder.current_position_deg = 0.0f;
+            encoder.filtered_rpm = 0.0f;
+            last_rpm_for_accel = 0.0f;
+            
+            trajectory.target_pos = 0.0f;
+            trajectory.current_setpoint_pos = 0.0f;
+            trajectory.current_setpoint_vel = 0.0f;
+            buffered_target_pos = 0.0f;
+            
+            pid_speed.integral = 0.0f;
+            pid_speed.error_prev = 0.0f;
+            pid_speed.d_filt = 0.0f;
+            
+            pid_position.integral = 0.0f;
+            pid_position.error_prev = 0.0f;
+            pid_position.d_filt = 0.0f;
+            
+            printf("[HOME] Temporary Home Set. Original Home is now at %.2f deg.\r\n", original_home_offset_deg);
+        } else if (a_button_click_count == 2) {
+            // DOUBLE CLICK: Go to Temporary Home
+            Motor_SendAudioCommand('2');
+            trajectory.target_pos = 0.0f;
+            current_mode = MOTOR_MODE_POSITION;
+            printf("[HOME] Moving to Temporary Home (0.0)\r\n");
+        } else if (a_button_click_count >= 3) {
+            // TRIPLE CLICK: Go to Original Home
+            Motor_SendAudioCommand('3');
+            trajectory.target_pos = original_home_offset_deg;
+            current_mode = MOTOR_MODE_POSITION;
+            printf("[HOME] Moving to Original Home (%.2f)\r\n", original_home_offset_deg);
+        }
+        
+        a_button_click_count = 0;
+        a_button_evaluating = false;
     }
 
-    // Joystick safety check: Timeout if no data received for 500ms
+    // Joystick safety check: Increased timeout to 30s since heartbeat is removed
     if (control_system_mode == CONTROL_MODE_JOYSTICK) {
-        if (HAL_GetTick() - joystick_watchdog_timer > 500) {
+        if (HAL_GetTick() - joystick_watchdog_timer > 30000) {
             is_joystick_connected = false;
         }
 
@@ -802,6 +1087,13 @@ void Motor_ControlLoop(void)
 
     /* --- Velocity Loop --- */
     if (current_mode == MOTOR_MODE_SPEED) {
+        // VIRTUAL HARD STOPS: Prevent further motion in the direction of the limit
+        if (encoder.current_position_deg >= SOFT_LIMIT_DEG && trajectory.target_vel > 0.0f) {
+            trajectory.target_vel = 0.0f;
+        } else if (encoder.current_position_deg <= -SOFT_LIMIT_DEG && trajectory.target_vel < 0.0f) {
+            trajectory.target_vel = 0.0f;
+        }
+
         float ff = tuning.speed_Kf * trajectory.target_vel;
         current_applied_pwm = PID_Compute(&pid_speed, trajectory.target_vel, encoder.filtered_rpm) + ff; 
         PWM_Apply(current_applied_pwm);
@@ -809,7 +1101,18 @@ void Motor_ControlLoop(void)
         trajectory.current_setpoint_pos = encoder.current_position_deg;
     } 
     /* --- Position Loop --- */
-    else if (current_mode == MOTOR_MODE_POSITION || current_mode == MOTOR_MODE_GHOST) {
+    else if (current_mode == MOTOR_MODE_POSITION || current_mode == MOTOR_MODE_GHOST || current_mode == MOTOR_MODE_HOMING) {
+        // VIRTUAL HARD STOPS: Clamp target position
+        if (trajectory.target_pos > SOFT_LIMIT_DEG) {
+            trajectory.target_pos = SOFT_LIMIT_DEG;
+            static uint32_t last_warn_up = 0;
+            if (HAL_GetTick() - last_warn_up > 1000) { Motor_SendAudioCommand('W'); last_warn_up = HAL_GetTick(); }
+        }
+        if (trajectory.target_pos < -SOFT_LIMIT_DEG) {
+            trajectory.target_pos = -SOFT_LIMIT_DEG;
+            static uint32_t last_warn_dn = 0;
+            if (HAL_GetTick() - last_warn_dn > 1000) { Motor_SendAudioCommand('W'); last_warn_dn = HAL_GetTick(); }
+        }
         Trajectory_Generator_Update();
         
         // Dynamic speed recovery
@@ -822,13 +1125,15 @@ void Motor_ControlLoop(void)
         current_applied_pwm = PID_Compute(&pid_speed, target_rpm, encoder.filtered_rpm) + ff; 
         PWM_Apply(current_applied_pwm);
 
-        // Ghost Mode settle check
+        // Ghost Mode settle check: Must be within 0.5 deg AND < 1.0 RPM for 3 seconds
         if (ghost_move_active) {
             float pos_error = fabsf(encoder.current_position_deg - trajectory.target_pos);
-            if (pos_error <= 1.0f) {
+            float vel_error = fabsf(encoder.filtered_rpm);
+            
+            if (pos_error <= 0.5f && vel_error < 1.0f) {
                 if (ghost_settle_start_tick == 0) {
                     ghost_settle_start_tick = HAL_GetTick();
-                } else if (HAL_GetTick() - ghost_settle_start_tick >= 500) {
+                } else if (HAL_GetTick() - ghost_settle_start_tick >= 3000) {
                     ghost_move_active = false;
                     ghost_dump_requested = true;
                     ghost_settle_start_tick = 0;
@@ -899,14 +1204,14 @@ void Motor_ControlLoop(void)
         stall_timer = 0;
     }
 
-    // 4. Over-Rotation Protection
+    // 4. Over-Rotation Protection (Virtual Wall Notification)
     if (fabsf(encoder.current_position_deg) > SOFT_LIMIT_DEG) {
-        fault_code |= FAULT_OVER_ROTATION;
-        if (safety_enabled) {
-            emergency_stop = true;
-            printf("CRITICAL: SOFT LIMIT EXCEEDED (WIRE SNAP PROTECT)\r\n");
-            PWM_Apply(0.0f);
+        if (!(fault_code & FAULT_OVER_ROTATION)) {
+            fault_code |= FAULT_OVER_ROTATION;
+            printf("WARNING: SOFT LIMIT REACHED (HARD STOP ACTIVE)\r\n");
         }
+    } else {
+        fault_code &= ~FAULT_OVER_ROTATION;
     }
 }
 
